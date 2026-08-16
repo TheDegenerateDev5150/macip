@@ -1,72 +1,82 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""Automatically change the IP address of an interface to random values."""
 
-import subprocess
 import argparse
-import random
-import re
-import time
+import sys
+
+import macip_lib
+from macip_lib import MacipError
+
 
 def get_arguments():
-    parser = argparse.ArgumentParser(description="IP address changer tool")
-    parser.add_argument("-i", "--interface", dest="interface", required=True, help="Interface to change its IP address")
+    parser = argparse.ArgumentParser(
+        description="Repeatedly change the IP address of an interface to random values"
+    )
+    parser.add_argument("-i", "--interface", required=True,
+                        help="Network interface to change (e.g. wlan0, eth0)")
+    parser.add_argument("--network", default="192.168.0.0/16", metavar="CIDR",
+                        help="Subnet to pick random addresses from (default: 192.168.0.0/16)")
+    parser.add_argument("--prefix", type=int, default=24, metavar="N",
+                        help="CIDR prefix length to assign (default: 24)")
+    parser.add_argument("--times", type=int, default=5, metavar="N",
+                        help="How many times to change the IP (default: 5)")
+    parser.add_argument("--interval", type=float, default=1.0, metavar="SECONDS",
+                        help="Seconds between changes (default: 1.0)")
+    parser.add_argument("--restore", action="store_true",
+                        help="Restore the original configuration saved by a previous run, then exit")
+    parser.add_argument("--no-restore", action="store_true",
+                        help="Do not restore the original configuration on Ctrl+C")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate the changes without touching the system")
     return parser.parse_args()
 
-def check_interface_exists(interface):
+
+def main():
+    args = get_arguments()
+    macip_lib.set_dry_run(args.dry_run)
+
     try:
-        subprocess.check_output(["ifconfig", interface], stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+        if args.restore:
+            if not args.dry_run:
+                macip_lib.require_root()
+            macip_lib.restore_config(args.interface)
+            return
 
-def generate_random_ip():
-    
-    return f"192.168.{random.randint(0, 255)}.{random.randint(1, 254)}"
+        if not args.dry_run:
+            macip_lib.require_root()
 
-def change_ip(interface, new_ip):
-    try:
-        subprocess.call(["ifconfig", interface, new_ip, "netmask", "255.255.255.0"])
-    except Exception as e:
-        print(f"[-] Failed to change IP address: {e}")
+        if not macip_lib.interface_exists(args.interface):
+            available = ", ".join(macip_lib.list_interfaces()) or "none"
+            raise MacipError(
+                f"Interface '{args.interface}' does not exist. "
+                f"Available interfaces: {available}"
+            )
 
-def get_current_ip(interface):
-    try:
-        ifconfig_result = subprocess.check_output(["ifconfig", interface], stderr=subprocess.DEVNULL).decode("utf-8")
-        ip_address_search_result = re.search(r"inet\s(\d+\.\d+\.\d+\.\d+)", ifconfig_result)
-        if ip_address_search_result:
-            return ip_address_search_result.group(1)
-        else:
-            return None
-    except subprocess.CalledProcessError:
-        return None
+        if args.times < 1:
+            raise MacipError("--times must be at least 1.")
+        if args.interval < 0:
+            raise MacipError("--interval must be zero or positive.")
+
+        macip_lib.save_config(args.interface)
+
+        with macip_lib.GracefulExit(args.interface, restore=not args.no_restore):
+            for i in range(1, args.times + 1):
+                new_ip = macip_lib.generate_random_ip(args.network)
+                macip_lib.log(f"\n[*] Attempt {i}/{args.times} - changing IP to {new_ip}")
+                macip_lib.set_ip(args.interface, new_ip, args.prefix)
+
+                updated = macip_lib.get_current_ip(args.interface)
+                if updated == new_ip:
+                    macip_lib.log(f"[+] IP successfully changed to {updated}")
+                else:
+                    macip_lib.log("[-] Failed to change the IP address.")
+                macip_lib.pace(args.interval)
+
+        macip_lib.log(f"\n[*] Done. Applied {args.times} IP changes to {args.interface}.")
+    except MacipError as exc:
+        macip_lib.log(f"[-] {exc}")
+        sys.exit(1)
 
 
-options = get_arguments()
-
-
-if not check_interface_exists(options.interface):
-    print(f"[-] Interface '{options.interface}' does not exist. Exiting.")
-else:
-    
-    current_ip = get_current_ip(options.interface)
-    if current_ip:
-        print(f"[*] Current IP address: {current_ip}")
-    else:
-        print(f"[-] Could not retrieve the current IP address.")
-
-    
-    for layer in range(1, 6):
-        new_ip = generate_random_ip()
-        print(f"\n[+] Changing IP address to: {new_ip}")
-        
-        
-        change_ip(options.interface, new_ip)
-        
-        
-        current_ip = get_current_ip(options.interface)
-        if current_ip == new_ip:
-            print(f"[+] Successfully changed to IP: {current_ip}")
-        else:
-            print(f"[-] Failed to change the IP address.")
-        
-        
-        time.sleep(1)  
+if __name__ == "__main__":
+    main()

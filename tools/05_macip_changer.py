@@ -1,115 +1,85 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""Manually change both the MAC and IP address of a network interface."""
 
-import subprocess
 import argparse
-import re
+import sys
+
+import macip_lib
+from macip_lib import MacipError
+
 
 def get_arguments():
-    parser = argparse.ArgumentParser(description="IP and MAC address changer tool")
-    parser.add_argument("-i", "--interface", dest="interface", required=True, help="Interface to change its IP and MAC address")
-    parser.add_argument("-ip", "--ipaddress", dest="new_ip", required=True, help="New IP address to assign")
-    parser.add_argument("-m", "--mac", dest="new_mac", required=True, help="New MAC address to assign")
+    parser = argparse.ArgumentParser(
+        description="Manually change both the MAC and IP address of a network interface"
+    )
+    parser.add_argument("-i", "--interface", required=True,
+                        help="Network interface to change (e.g. wlan0, eth0)")
+    parser.add_argument("-m", "--mac", required=True,
+                        help="New MAC address (e.g. 00:11:22:33:44:55)")
+    parser.add_argument("-ip", "--ipaddress", dest="new_ip", required=True,
+                        help="New IPv4 address (e.g. 192.168.1.100)")
+    parser.add_argument("--prefix", type=int, default=24, metavar="N",
+                        help="CIDR prefix length of the new address (default: 24)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate the changes without touching the system")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Do not remember the original configuration for later restore")
     return parser.parse_args()
 
-def check_interface_exists(interface):
+
+def main():
+    args = get_arguments()
+    macip_lib.set_dry_run(args.dry_run)
+
     try:
-        subprocess.check_output(["ifconfig", interface], stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+        if not args.dry_run:
+            macip_lib.require_root()
 
-def validate_ip_address(ip):
-    ip_regex = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
-    if re.match(ip_regex, ip):
-        segments = ip.split('.')
-        for segment in segments:
-            if int(segment) > 255:
-                return False
-        return True
-    else:
-        return False
+        if not macip_lib.interface_exists(args.interface):
+            available = ", ".join(macip_lib.list_interfaces()) or "none"
+            raise MacipError(
+                f"Interface '{args.interface}' does not exist. "
+                f"Available interfaces: {available}"
+            )
 
-def validate_mac_address(mac):
-    mac_regex = r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$"
-    if re.match(mac_regex, mac):
-        return True
-    else:
-        print("[-] Invalid MAC address format. A valid MAC address is in the format XX:XX:XX:XX:XX:XX")
-        return False
+        if not macip_lib.validate_mac(args.mac):
+            raise MacipError(
+                "Invalid MAC address. Expected format XX:XX:XX:XX:XX:XX "
+                "(six hexadecimal pairs)."
+            )
+        if not macip_lib.validate_ip(args.new_ip):
+            raise MacipError(
+                "Invalid IP address. Expected a valid IPv4 address (e.g. 192.168.1.100)."
+            )
 
-def change_ip(interface, new_ip):
-    print(f"[+] Changing IP address of interface {interface} to {new_ip}")
-    subprocess.call(["ifconfig", interface, new_ip, "netmask", "255.255.255.0"])
+        current_mac = macip_lib.get_current_mac(args.interface)
+        current_ip = macip_lib.get_current_ip(args.interface)
+        macip_lib.log(f"[*] Current MAC address of {args.interface}: {current_mac}")
+        macip_lib.log(f"[*] Current IP address of {args.interface}: {current_ip}")
 
-def change_mac(interface, new_mac):
-    print(f"[+] Changing MAC address of interface {interface} to {new_mac}")
-    subprocess.call(["ifconfig", interface, "down"])
-    subprocess.call(["ifconfig", interface, "hw", "ether", new_mac])
-    subprocess.call(["ifconfig", interface, "up"])
+        if not args.no_save:
+            macip_lib.save_config(args.interface)
 
-def get_current_ip(interface):
-    try:
-        ifconfig_result = subprocess.check_output(["ifconfig", interface], stderr=subprocess.DEVNULL).decode("utf-8")
-        ip_address_search_result = re.search(r"inet\s(\d+\.\d+\.\d+\.\d+)", ifconfig_result)
-        if ip_address_search_result:
-            return ip_address_search_result.group(1)
+        # MAC first: its down/up cycle wipes the address, so the IP is set last.
+        macip_lib.set_mac(args.interface, args.mac)
+        macip_lib.set_ip(args.interface, args.new_ip, args.prefix)
+
+        updated_mac = macip_lib.get_current_mac(args.interface)
+        updated_ip = macip_lib.get_current_ip(args.interface)
+
+        if updated_ip == args.new_ip:
+            macip_lib.log(f"[+] IP address successfully changed to {updated_ip}")
         else:
-            print("[-] Could not read IP address.")
-            return None
-    except subprocess.CalledProcessError:
-        print(f"[-] Could not execute 'ifconfig' for interface {interface}. Please check if the interface exists.")
-        return None
+            macip_lib.log("[-] Failed to change the IP address.")
 
-def get_current_mac(interface):
-    try:
-        ifconfig_result = subprocess.check_output(["ifconfig", interface], stderr=subprocess.DEVNULL).decode("utf-8")
-        mac_address_search_result = re.search(r"\w\w:\w\w:\w\w:\w\w:\w\w:\w\w", ifconfig_result)
-        if mac_address_search_result:
-            return mac_address_search_result.group(0)
+        if updated_mac and macip_lib.normalize_mac(updated_mac) == macip_lib.normalize_mac(args.mac):
+            macip_lib.log(f"[+] MAC address successfully changed to {updated_mac}")
         else:
-            print("[-] Could not read MAC address.")
-            return None
-    except subprocess.CalledProcessError:
-        print(f"[-] Could not execute 'ifconfig' for interface {interface}. Please check if the interface exists.")
-        return None
+            macip_lib.log("[-] Failed to change the MAC address.")
+    except MacipError as exc:
+        macip_lib.log(f"[-] {exc}")
+        sys.exit(1)
 
 
-options = get_arguments()
-
-
-if not check_interface_exists(options.interface):
-    print(f"[-] Interface '{options.interface}' does not exist. Exiting.")
-else:
-    
-    if not validate_ip_address(options.new_ip):
-        print("[-] Invalid IP address format. Please provide a valid IP address (e.g., 192.168.1.1).")
-    
-    elif not validate_mac_address(options.new_mac):
-        print("[-] Invalid MAC address format. Please provide a valid MAC address (e.g., 00:1A:2B:3C:4D:5E).")
-    else:
-        
-        current_ip = get_current_ip(options.interface)
-        current_mac = get_current_mac(options.interface)
-
-        if current_ip:
-            print(f"[*] Current IP address of {options.interface}: {current_ip}")
-        if current_mac:
-            print(f"[*] Current MAC address of {options.interface}: {current_mac}")
-        
-        
-        change_ip(options.interface, options.new_ip)
-        change_mac(options.interface, options.new_mac)
-        
-        
-        updated_ip = get_current_ip(options.interface)
-        updated_mac = get_current_mac(options.interface)
-
-        if updated_ip == options.new_ip:
-            print(f"[+] Successfully changed IP address to: {updated_ip}")
-        else:
-            print("[-] Failed to change the IP address.")
-        
-        if updated_mac and updated_mac.lower() == options.new_mac.lower():
-            print(f"[+] Successfully changed MAC address to: {updated_mac}")
-        else:
-            print("[-] Failed to change the MAC address.")
+if __name__ == "__main__":
+    main()
