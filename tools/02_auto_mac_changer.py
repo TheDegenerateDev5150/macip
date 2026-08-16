@@ -22,6 +22,8 @@ def get_arguments():
                         help="Restore the original configuration saved by a previous run, then exit")
     parser.add_argument("--no-restore", action="store_true",
                         help="Do not restore the original configuration on Ctrl+C")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Do not overwrite the saved original configuration (for scheduled rotation)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the changes without touching the system")
     return parser.parse_args()
@@ -53,7 +55,8 @@ def main():
         if args.interval < 0:
             raise MacipError("--interval must be zero or positive.")
 
-        macip_lib.save_config(args.interface)
+        if not args.no_save:
+            macip_lib.save_config(args.interface)
 
         with macip_lib.GracefulExit(args.interface, restore=not args.no_restore):
             for i in range(1, args.times + 1):

@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import re
 import subprocess
@@ -79,12 +80,20 @@ def test_generate_random_mac_locally_administered_unicast():
 
 
 def test_generate_random_ip_inside_network():
+    net = ipaddress.ip_network("192.168.0.0/16")
     for _ in range(100):
-        ip = macip_lib.generate_random_ip("192.168.0.0/16")
-        parts = [int(p) for p in ip.split(".")]
-        assert parts[0] == 192 and parts[1] == 168
-        # never the network or broadcast address of a /24 in that space
-        assert 1 <= parts[3] <= 254
+        addr = ipaddress.ip_address(macip_lib.generate_random_ip("192.168.0.0/16"))
+        assert addr in net
+        # never the network or broadcast address of the /16
+        assert addr != net.network_address
+        assert addr != net.broadcast_address
+
+
+def test_generate_random_ip_24_excludes_network_and_broadcast():
+    net = ipaddress.ip_network("192.168.5.0/24")
+    for _ in range(100):
+        addr = ipaddress.ip_address(macip_lib.generate_random_ip("192.168.5.0/24"))
+        assert net.network_address < addr < net.broadcast_address
 
 
 def test_generate_random_ip_custom_network():
@@ -104,8 +113,9 @@ def test_normalize_mac():
 
 
 def test_prefix_to_netmask():
+    assert macip_lib.prefix_to_netmask(8) == "255.0.0.0"
+    assert macip_lib.prefix_to_netmask(16) == "255.255.0.0"
     assert macip_lib.prefix_to_netmask(24) == "255.255.255.0"
-    assert macip_lib.prefix_to_netmask(16) == "255.0.0.0"
     with pytest.raises(MacipError):
         macip_lib.prefix_to_netmask(33)
 
@@ -123,6 +133,10 @@ def test_list_interfaces_parses_ip_output(monkeypatch):
         "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n"
         "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\n"
         "3: wlan0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN\n"
+    )
+    monkeypatch.setattr(
+        macip_lib.shutil, "which",
+        lambda name: "/usr/sbin/ip" if name == "ip" else None,
     )
     monkeypatch.setattr(macip_lib, "_run", lambda cmd, check=False: _fake_run(out))
     assert macip_lib.list_interfaces() == ["lo", "eth0", "wlan0"]
@@ -268,7 +282,10 @@ def test_dry_run_skips_state_file_writes(tmp_path, monkeypatch):
 
 def test_save_and_restore_config(monkeypatch):
     monkeypatch.setattr(macip_lib, "get_current_mac", lambda iface: "00:11:22:33:44:55")
-    monkeypatch.setattr(macip_lib, "get_current_ip", lambda iface: "192.168.1.99")
+    monkeypatch.setattr(
+        macip_lib, "get_current_ip",
+        lambda iface, version=4: "192.168.1.99" if version == 4 else None,
+    )
     restored = []
 
     def fake_set_mac(iface, mac):
@@ -354,3 +371,219 @@ def test_run_check_raises_on_failure(monkeypatch):
     )
     with pytest.raises(MacipError, match="boom"):
         macip_lib._run(["ip", "link", "show"], check=True)
+
+
+# --------------------------------------------------------------------------
+# IPv6
+# --------------------------------------------------------------------------
+
+def test_ip_version():
+    assert macip_lib.ip_version("192.168.1.1") == 4
+    assert macip_lib.ip_version("fd00::1") == 6
+    assert macip_lib.ip_version("not-an-ip") is None
+
+
+@pytest.mark.parametrize("ip", [
+    "fd00::1",
+    "2001:db8::1",
+    "fe80::1",
+    "fd12:3456:789a:1::42",
+])
+def test_validate_ip_accepts_ipv6(ip):
+    assert macip_lib.validate_ip(ip)
+
+
+@pytest.mark.parametrize("ip", [
+    "fd00::gg",
+    "2001:db8::/64",
+    "::1",      # loopback
+    "::",       # unspecified
+    "ff02::1",  # multicast
+    "fd00::1 ",
+])
+def test_validate_ip_rejects_bad_ipv6(ip):
+    assert not macip_lib.validate_ip(ip)
+
+
+def test_generate_random_ipv6_inside_network():
+    net = ipaddress.ip_network("fd00::/64")
+    for _ in range(50):
+        addr = ipaddress.ip_address(macip_lib.generate_random_ip("fd00::/64"))
+        assert addr in net
+        assert addr != net.network_address
+        assert addr != net.broadcast_address
+
+
+def test_get_current_ip_v6_parses_ip_output(monkeypatch):
+    out = (
+        "2: eth0    inet6 fd00::1/64 scope global \n"
+        "    valid_lft forever preferred_lft forever\n"
+        "2: eth0    inet6 fe80::1234/64 scope link \n"
+    )
+    monkeypatch.setattr(macip_lib, "_run", lambda cmd, check=False: _fake_run(out))
+    assert macip_lib.get_current_ip("eth0", 6) == "fd00::1"
+
+
+def test_get_current_ip_v6_ignores_link_local_only(monkeypatch):
+    out = "2: eth0    inet6 fe80::1234/64 scope link \n"
+    monkeypatch.setattr(macip_lib, "_run", lambda cmd, check=False: _fake_run(out))
+    assert macip_lib.get_current_ip("eth0", 6) is None
+
+
+def test_get_current_ip_v6_parses_ifconfig_output(monkeypatch):
+    out = (
+        "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n"
+        "        inet6 addr: fd00::7/64 Scope:Global\n"
+        "        inet6 addr: fe80::1/64 Scope:Link\n"
+    )
+    monkeypatch.setattr(macip_lib, "_BACKEND", "ifconfig")
+    monkeypatch.setattr(macip_lib, "_run", lambda cmd, check=False: _fake_run(out))
+    assert macip_lib.get_current_ip("eth0", 6) == "fd00::7"
+
+
+def test_set_ip_v6_builds_ip_commands(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, check=False):
+        calls.append(list(cmd))
+        return _fake_run()
+
+    monkeypatch.setattr(macip_lib, "_run", fake_run)
+    macip_lib.set_ip("eth0", "fd00::1", 64)
+    assert calls == [
+        ["ip", "addr", "replace", "fd00::1/64", "dev", "eth0"],
+        ["ip", "link", "set", "dev", "eth0", "up"],
+    ]
+
+
+def test_set_ip_v6_builds_ifconfig_commands(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, check=False):
+        calls.append(list(cmd))
+        return _fake_run()
+
+    monkeypatch.setattr(macip_lib, "_BACKEND", "ifconfig")
+    monkeypatch.setattr(macip_lib, "_run", fake_run)
+    macip_lib.set_ip("eth0", "fd00::1", 64)
+    assert calls == [
+        ["ifconfig", "eth0", "inet6", "add", "fd00::1/64"],
+    ]
+
+
+def test_set_ip_defaults_prefix_by_family(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, check=False):
+        calls.append(list(cmd))
+        return _fake_run()
+
+    monkeypatch.setattr(macip_lib, "_run", fake_run)
+    macip_lib.set_ip("eth0", "192.168.1.1")
+    macip_lib.set_ip("eth0", "fd00::1")
+    addresses = [c[3] for c in calls if c[0] == "ip" and c[1] == "addr"]
+    assert addresses == ["192.168.1.1/24", "fd00::1/64"]
+
+
+def test_set_ip_rejects_invalid(monkeypatch):
+    monkeypatch.setattr(macip_lib, "_run", lambda cmd, check=False: _fake_run())
+    with pytest.raises(MacipError, match="Invalid IP"):
+        macip_lib.set_ip("eth0", "not-an-ip")
+
+
+def test_save_config_skips_link_local_ipv6(monkeypatch):
+    monkeypatch.setattr(macip_lib, "get_current_mac", lambda iface: "00:11:22:33:44:55")
+    monkeypatch.setattr(
+        macip_lib, "get_current_ip",
+        lambda iface, version=4: "fe80::1" if version == 6 else "192.168.1.9",
+    )
+    macip_lib.save_config("eth0")
+    data = json.loads((macip_lib.STATE_DIR / "eth0.json").read_text())
+    assert data["ip6"] is None
+    assert data["ip"] == "192.168.1.9"
+
+
+def test_restore_restores_ipv6(monkeypatch):
+    macip_lib.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (macip_lib.STATE_DIR / "eth0.json").write_text(json.dumps({
+        "interface": "eth0",
+        "mac": "00:11:22:33:44:55",
+        "ip": "192.168.1.9",
+        "ip6": "fd00::9",
+    }))
+    restored = []
+    monkeypatch.setattr(macip_lib, "set_mac", lambda iface, mac: restored.append(("mac", mac)))
+    monkeypatch.setattr(
+        macip_lib, "set_ip", lambda iface, ip, prefix=None: restored.append((ip, prefix)),
+    )
+    macip_lib.restore_config("eth0")
+    assert restored == [
+        ("mac", "00:11:22:33:44:55"),
+        ("192.168.1.9", None),
+        ("fd00::9", None),
+    ]
+
+
+def _write_saved_state(interface, mac="00:11:22:33:44:55", ip="192.168.1.9", ip6="fd00::9"):
+    macip_lib.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (macip_lib.STATE_DIR / f"{interface}.json").write_text(json.dumps({
+        "interface": interface, "mac": mac, "ip": ip, "ip6": ip6,
+    }))
+
+
+def test_list_saved_configs_empty():
+    assert macip_lib.list_saved_configs() == []
+
+
+def test_list_saved_configs_returns_interfaces():
+    _write_saved_state("eth0")
+    _write_saved_state("wlan0")
+    assert macip_lib.list_saved_configs() == ["eth0", "wlan0"]
+
+
+def test_restore_all_restores_every_interface(monkeypatch):
+    _write_saved_state("eth0", mac="00:11:22:33:44:55")
+    _write_saved_state("wlan0", mac="aa:bb:cc:dd:ee:ff")
+    restored = []
+    monkeypatch.setattr(macip_lib, "set_mac", lambda iface, mac: restored.append((iface, mac)))
+    monkeypatch.setattr(
+        macip_lib, "set_ip", lambda iface, ip, prefix=None: None,
+    )
+    result = macip_lib.restore_all_configs()
+    assert [r["interface"] for r in result] == ["eth0", "wlan0"]
+    assert all(r["status"] == "restored" for r in result)
+    assert result[0]["mac"] == "00:11:22:33:44:55"
+    assert result[1]["mac"] == "aa:bb:cc:dd:ee:ff"
+    assert restored == [
+        ("eth0", "00:11:22:33:44:55"),
+        ("wlan0", "aa:bb:cc:dd:ee:ff"),
+    ]
+    # state files are removed after a successful restore
+    assert macip_lib.list_saved_configs() == []
+
+
+def test_restore_all_without_configs_raises():
+    with pytest.raises(MacipError, match="No saved configurations"):
+        macip_lib.restore_all_configs()
+
+
+def test_restore_all_continues_on_failure(monkeypatch, capsys):
+    _write_saved_state("eth0")
+    _write_saved_state("wlan0")
+    real_restore = macip_lib.restore_config
+
+    def flaky(iface):
+        if iface == "eth0":
+            raise MacipError("boom")
+        return real_restore(iface)
+
+    monkeypatch.setattr(macip_lib, "restore_config", flaky)
+    # the real restore_config needs the set_* primitives stubbed (no real 'ip' here)
+    monkeypatch.setattr(macip_lib, "set_mac", lambda iface, mac: None)
+    monkeypatch.setattr(macip_lib, "set_ip", lambda iface, ip, prefix=None: None)
+    result = macip_lib.restore_all_configs()
+    statuses = {r["interface"]: r["status"] for r in result}
+    assert statuses == {"eth0": "failed", "wlan0": "restored"}
+    assert result[0]["error"] == "boom"
+    assert "eth0: boom" in capsys.readouterr().out
+    assert macip_lib.list_saved_configs() == ["eth0"]  # failed one keeps its state

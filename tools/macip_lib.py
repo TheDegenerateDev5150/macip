@@ -40,7 +40,6 @@ VERSION = "3.0"
 STATE_DIR = Path("/var/tmp/macip")
 
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
-_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 _DRY_RUN = False
 _BACKEND: Optional[str] = None
@@ -70,6 +69,24 @@ def is_dry_run() -> bool:
 
 def log(message: str) -> None:
     print(message)
+
+
+def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
+    """Print an aligned ASCII table through ``log``."""
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    def fmt(cells):
+        return "  " + "  ".join(
+            str(cell).ljust(widths[i]) for i, cell in enumerate(cells)
+        ).rstrip()
+
+    log(fmt(headers))
+    log("  " + "-" * (sum(widths) + 2 * (len(headers) - 1)))
+    for row in rows:
+        log(fmt(row))
 
 
 # --------------------------------------------------------------------------
@@ -231,15 +248,26 @@ def set_mac(interface: str, mac: str) -> None:
 # IP addresses
 # --------------------------------------------------------------------------
 
+def ip_version(ip: str) -> Optional[int]:
+    """Return 4 or 6 if ``ip`` parses as an IPv4/IPv6 address, else None."""
+    try:
+        return ipaddress.ip_address(ip).version
+    except ValueError:
+        return None
+
+
 def validate_ip(ip: str) -> bool:
-    """Return True if ``ip`` is a valid, usable IPv4 address."""
-    if not _IPV4_RE.match(ip):
-        return False
+    """Return True if ``ip`` is a valid, usable IPv4 or IPv6 address."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    return addr.version == 4 and not addr.is_multicast and not addr.is_loopback
+    return not (addr.is_multicast or addr.is_loopback or addr.is_unspecified)
+
+
+def normalize_ip(ip: str) -> str:
+    """Normalise any valid IP to its canonical (lowercase, compressed) form."""
+    return str(ipaddress.ip_address(ip))
 
 
 def prefix_to_netmask(prefix: int) -> str:
@@ -253,40 +281,76 @@ def generate_random_ip(network: str = "192.168.0.0/16") -> str:
     """
     Generate a random usable host IP inside ``network``.
 
-    Network and broadcast addresses are excluded automatically.
+    Network and broadcast addresses are excluded automatically. The pick is
+    O(1) — a random offset is added to the network address instead of
+    enumerating every host — so huge ranges such as ``10.0.0.0/8`` are fine.
     """
     try:
         net = ipaddress.ip_network(network, strict=False)
     except ValueError as exc:
         raise MacipError(f"Invalid network '{network}': {exc}") from exc
-    hosts = list(net.hosts())
-    if not hosts:
+    if net.num_addresses < 3:
         raise MacipError(f"Network '{network}' has no usable host addresses.")
-    return str(random.choice(hosts))
+    # usable hosts are network+1 .. last-1 (excludes the network address and,
+    # for IPv4, the broadcast address)
+    offset = random.randint(0, net.num_addresses - 3)
+    return str(net.network_address + (offset + 1))
 
 
-def get_current_ip(interface: str) -> Optional[str]:
-    """Return the current IPv4 of ``interface`` or None if it cannot be read."""
+def get_current_ip(interface: str, version: int = 4) -> Optional[str]:
+    """
+    Return the current IPv4 (version=4) or IPv6 (version=6) address of
+    ``interface``, or None if it cannot be read.
+
+    For IPv6, link-local addresses are ignored when a global/ULA address is
+    present, and None is returned if only link-local addresses exist — they
+    are derived from the MAC and regenerate automatically.
+    """
     try:
         if backend() == "ip":
-            out = _run(["ip", "-o", "-4", "addr", "show", "dev", interface]).stdout
+            family = "-6" if version == 6 else "-4"
+            out = _run(["ip", "-o", family, "addr", "show", "dev", interface]).stdout
         else:
             out = _run(["ifconfig", interface]).stdout
     except MacipError:
+        return None
+    if version == 6:
+        matches = re.findall(
+            r"inet6(?:\s+addr:)?\s+([0-9a-fA-F:]+)(?:%[0-9a-zA-Z.]+)?/\d+", out
+        )
+        for candidate in matches:
+            try:
+                addr = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if addr.version == 6 and not addr.is_link_local and not addr.is_loopback:
+                return str(addr)
         return None
     match = re.search(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})", out)
     return match.group(1) if match else None
 
 
-def set_ip(interface: str, ip: str, prefix: int = 24) -> None:
-    """Assign ``ip`` (with the given CIDR prefix) to ``interface``."""
-    log(f"[+] Setting IP address of {interface} to {ip}/{prefix}")
+def set_ip(interface: str, ip: str, prefix: Optional[int] = None) -> None:
+    """
+    Assign ``ip`` to ``interface``. The address family (IPv4/IPv6) is
+    auto-detected; ``prefix`` defaults to 24 for IPv4 and 64 for IPv6.
+    """
+    version = ip_version(ip)
+    if version is None:
+        raise MacipError(f"Invalid IP address: {ip}")
+    if prefix is None:
+        prefix = 64 if version == 6 else 24
+    family = "IPv6" if version == 6 else "IPv4"
+    log(f"[+] Setting {family} address of {interface} to {ip}/{prefix}")
     if backend() == "ip":
         _run(["ip", "addr", "replace", f"{ip}/{prefix}", "dev", interface], check=True)
         _run(["ip", "link", "set", "dev", interface, "up"], check=True)
     else:
-        netmask = prefix_to_netmask(prefix)
-        _run(["ifconfig", interface, ip, "netmask", netmask], check=True)
+        if version == 6:
+            _run(["ifconfig", interface, "inet6", "add", f"{ip}/{prefix}"], check=True)
+        else:
+            netmask = prefix_to_netmask(prefix)
+            _run(["ifconfig", interface, ip, "netmask", netmask], check=True)
 
 
 # --------------------------------------------------------------------------
@@ -314,8 +378,21 @@ def save_config(interface: str) -> Optional[dict]:
         log(f"[dry-run] would save the original configuration of {interface}")
         return None
     mac = get_current_mac(interface)
-    ip = get_current_ip(interface)
-    data = {"interface": interface, "mac": mac, "ip": ip, "saved_at": int(time.time())}
+    ip = get_current_ip(interface, 4)
+    ip6 = get_current_ip(interface, 6)
+    if ip6:
+        try:
+            if ipaddress.ip_address(ip6).is_link_local:
+                ip6 = None
+        except ValueError:
+            ip6 = None
+    data = {
+        "interface": interface,
+        "mac": mac,
+        "ip": ip,
+        "ip6": ip6,
+        "saved_at": int(time.time()),
+    }
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         _state_path(interface).write_text(json.dumps(data, indent=2))
@@ -325,11 +402,12 @@ def save_config(interface: str) -> Optional[dict]:
     return data
 
 
-def restore_config(interface: str) -> None:
+def restore_config(interface: str) -> Optional[dict]:
     """Restore the original MAC/IP of ``interface`` and remove the saved state.
 
     The MAC is restored first (its down/up cycle wipes the address) and the
-    IP afterwards, mirroring the order used by the changers.
+    IP afterwards, mirroring the order used by the changers. Returns the
+    restored configuration (mac/ip/ip6) or None if nothing was saved.
     """
     data = get_saved_config(interface)
     if data is None:
@@ -338,17 +416,72 @@ def restore_config(interface: str) -> None:
             "Run a changer on this interface first."
         )
     if _DRY_RUN:
-        log(f"[dry-run] would restore {interface} to MAC: {data.get('mac')}, IP: {data.get('ip')}")
+        log(
+            f"[dry-run] would restore {interface} to MAC: {data.get('mac')}, "
+            f"IPv4: {data.get('ip')}, IPv6: {data.get('ip6')}"
+        )
     else:
+        # MAC first: its down/up cycle wipes the addresses, so IPs go last.
         if data.get("mac"):
             set_mac(interface, data["mac"])
         if data.get("ip"):
             set_ip(interface, data["ip"])
+        if data.get("ip6"):
+            set_ip(interface, data["ip6"])
         try:
             _state_path(interface).unlink()
         except OSError:
             pass
     log(f"[+] Original configuration restored for {interface}.")
+    return data
+
+
+def list_saved_configs() -> List[str]:
+    """Return the names of all interfaces that have a saved configuration."""
+    if not STATE_DIR.is_dir():
+        return []
+    return sorted(
+        path.stem for path in STATE_DIR.glob("*.json")
+        if path.stem and not path.stem.startswith(".")
+    )
+
+
+def restore_all_configs() -> List[dict]:
+    """
+    Restore every interface with a saved configuration.
+
+    A failure on one interface is logged and skipped so a single bad
+    interface does not abort the batch. Returns a list of per-interface
+    results: ``{interface, mac, ip, ip6, status}`` where ``status`` is
+    ``"restored"`` or ``"failed"`` (with an ``error`` field on failures).
+    """
+    interfaces = list_saved_configs()
+    if not interfaces:
+        raise MacipError(
+            "No saved configurations found. Run a changer on an interface first."
+        )
+    results: List[dict] = []
+    for interface in interfaces:
+        try:
+            data = restore_config(interface) or {}
+            results.append({
+                "interface": interface,
+                "mac": data.get("mac"),
+                "ip": data.get("ip"),
+                "ip6": data.get("ip6"),
+                "status": "restored",
+            })
+        except MacipError as exc:
+            log(f"[-] {interface}: {exc}")
+            results.append({
+                "interface": interface,
+                "mac": None,
+                "ip": None,
+                "ip6": None,
+                "status": "failed",
+                "error": str(exc),
+            })
+    return results
 
 
 # --------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatically change the IP address of an interface to random values."""
+"""Automatically change the IP address (IPv4 or IPv6) of an interface."""
 
 import argparse
 import sys
@@ -14,10 +14,14 @@ def get_arguments():
     )
     parser.add_argument("-i", "--interface", required=True,
                         help="Network interface to change (e.g. wlan0, eth0)")
+    parser.add_argument("--ipv6", action="store_true",
+                        help="Rotate random IPv6 addresses instead of IPv4")
     parser.add_argument("--network", default="192.168.0.0/16", metavar="CIDR",
-                        help="Subnet to pick random addresses from (default: 192.168.0.0/16)")
-    parser.add_argument("--prefix", type=int, default=24, metavar="N",
-                        help="CIDR prefix length to assign (default: 24)")
+                        help="IPv4 subnet to pick random addresses from (default: 192.168.0.0/16)")
+    parser.add_argument("--network6", default="fd00::/64", metavar="CIDR",
+                        help="IPv6 subnet to pick random addresses from (default: fd00::/64)")
+    parser.add_argument("--prefix", type=int, default=None, metavar="N",
+                        help="CIDR prefix length to assign (default: 24 for IPv4, 64 for IPv6)")
     parser.add_argument("--times", type=int, default=5, metavar="N",
                         help="How many times to change the IP (default: 5)")
     parser.add_argument("--interval", type=float, default=1.0, metavar="SECONDS",
@@ -26,6 +30,8 @@ def get_arguments():
                         help="Restore the original configuration saved by a previous run, then exit")
     parser.add_argument("--no-restore", action="store_true",
                         help="Do not restore the original configuration on Ctrl+C")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Do not overwrite the saved original configuration (for scheduled rotation)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the changes without touching the system")
     return parser.parse_args()
@@ -57,16 +63,23 @@ def main():
         if args.interval < 0:
             raise MacipError("--interval must be zero or positive.")
 
-        macip_lib.save_config(args.interface)
+        version = 6 if args.ipv6 else 4
+        network = args.network6 if args.ipv6 else args.network
+        prefix = args.prefix if args.prefix is not None else (64 if args.ipv6 else 24)
+
+        if not args.no_save:
+            macip_lib.save_config(args.interface)
 
         with macip_lib.GracefulExit(args.interface, restore=not args.no_restore):
             for i in range(1, args.times + 1):
-                new_ip = macip_lib.generate_random_ip(args.network)
-                macip_lib.log(f"\n[*] Attempt {i}/{args.times} - changing IP to {new_ip}")
-                macip_lib.set_ip(args.interface, new_ip, args.prefix)
+                new_ip = macip_lib.generate_random_ip(network)
+                macip_lib.log(
+                    f"\n[*] Attempt {i}/{args.times} - changing IPv{version} to {new_ip}"
+                )
+                macip_lib.set_ip(args.interface, new_ip, prefix)
 
-                updated = macip_lib.get_current_ip(args.interface)
-                if updated == new_ip:
+                updated = macip_lib.get_current_ip(args.interface, version)
+                if updated and macip_lib.normalize_ip(updated) == macip_lib.normalize_ip(new_ip):
                     macip_lib.log(f"[+] IP successfully changed to {updated}")
                 else:
                     macip_lib.log("[-] Failed to change the IP address.")

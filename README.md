@@ -12,6 +12,7 @@ MacIP offers six essential tools to manage your network interface, allowing you 
 
 - **MAC Address Management**: Change or automate MAC address assignments on your network interfaces.
 - **IP Address Management**: Modify or automate IP address assignments for greater control and privacy.
+- **IPv6 Support**: Every IP tool handles IPv4 **and** IPv6 — `-ip` auto-detects the family, auto changers can rotate random IPv6 addresses (`--ipv6`), and the combined changer can set both stacks at once (`--ip6`). Random IPv6 comes from ULA space (`fd00::/64`) by default, the IPv6 equivalent of RFC1918 private ranges.
 - **Combined MAC and IP Management**: Use a combination of MAC and IP address management for more complex use cases.
 - **Automation**: Automate the process of changing MAC and IP addresses for network testing or enhanced privacy.
 - **Backup & Restore**: Every change remembers the original interface configuration — restore it at any time with the `restore` command (or Ctrl+C during automatic changes).
@@ -94,6 +95,8 @@ After running the tool, you will see a simple menu listing the available tools a
 - `list`: List all available tools.
 - `options`: Show the current MacIP configuration.
 - `restore`: Restore the original MAC/IP configuration of an interface.
+- `restore-all`: Restore **every** interface MacIP has touched (any with a saved configuration).
+- `status`: Show saved configurations and active rotation timers.
 - `update`: Update MacIP to the latest version.
 - `use #`: Use a specific tool by its number (e.g., `use 1` to manually change the MAC address).
 
@@ -131,9 +134,13 @@ Every tool can be called directly for scripting and automation. Run any tool wit
 |------|-----------|---------|
 | `-i, --interface` | all | Network interface to change (required) |
 | `-m, --mac` | 1, 5 | New MAC address |
-| `-ip, --ipaddress` | 3, 5 | New IPv4 address |
-| `--prefix N` | 3, 4, 5, 6 | CIDR prefix length (default 24) |
-| `--network CIDR` | 4, 6 | Subnet for random addresses (default 192.168.0.0/16) |
+| `-ip, --ipaddress` | 3, 5 | New IP address — IPv4 or IPv6 (auto-detected) |
+| `--prefix N` | 3, 4, 5, 6 | CIDR prefix length (default 24 for IPv4, 64 for IPv6) |
+| `--ip6 ADDR` | 5 | Set an additional IP of the other family (dual-stack) |
+| `--prefix6 N` | 5 | CIDR prefix for `--ip6` (default 24/64 by family) |
+| `--ipv6` | 4, 6 | Rotate random IPv6 addresses instead of IPv4 |
+| `--network CIDR` | 4, 6 | IPv4 subnet for random addresses (default 192.168.0.0/16) |
+| `--network6 CIDR` | 4, 6 | IPv6 subnet for random addresses (default fd00::/64) |
 | `--times N` | 2, 4, 6 | Number of automatic changes (default 5) |
 | `--interval S` | 2, 4, 6 | Seconds between automatic changes (default 1.0) |
 | `--restore` | 2, 4, 6 | Restore the saved configuration, then exit |
@@ -150,8 +157,26 @@ sudo python3 tools/01_mac_changer.py -i wlan0 -m 00:11:22:33:44:55
 # Rotate the MAC 20 times, 30 seconds apart, restoring the original on Ctrl+C
 sudo python3 tools/02_auto_mac_changer.py -i wlan0 --times 20 --interval 30
 
+# Set an IPv6 address (family is auto-detected, /64 by default)
+sudo python3 tools/03_ip_changer.py -i eth0 -ip fd00::1
+
+# Dual-stack: MAC + IPv4 + IPv6 in one shot
+sudo python3 tools/05_macip_changer.py -i eth0 -m 00:11:22:33:44:55 -ip 192.168.1.100 --ip6 fd00::1
+
+# Rotate random IPv6 addresses 10 times (ULA space)
+sudo python3 tools/04_auto_ip_changer.py -i wlan0 --ipv6 --times 10
+
 # Revert an interface to its saved original configuration
 sudo python3 tools/restore.py -i wlan0
+
+# Revert every interface MacIP has touched (prompts for confirmation)
+sudo python3 tools/restore.py --all
+
+# Show what MacIP has saved and which rotation timers are active
+python3 tools/status.py
+
+# Same, but skip the confirmation prompt (for scripts)
+sudo python3 tools/restore.py --all --yes
 
 # Preview exactly what a change would do, without touching the system
 python3 tools/05_macip_changer.py -i eth0 -m 00:11:22:33:44:55 -ip 192.168.1.100 --dry-run
@@ -172,6 +197,42 @@ python -m pytest tests/ -v
 ```
 
 A CI pipeline (`.github/workflows/ci.yml`) runs the suite on Python 3.9/3.11/3.13 plus a bash syntax check on every push and pull request.
+
+### **Real-Device Testing**
+
+The mocked suite cannot verify that MAC/IP changes actually take effect on a live interface. To test against a real Linux kernel, run the bundled self-test as root:
+
+```bash
+sudo ./tools/self_test.sh
+```
+
+It creates a throwaway `dummy` interface (zero impact on your real NICs), runs every tool against it through the real `ip` command path, verifies each change by re-reading the interface state, tests the save/restore round trip, the dry-run guarantee and the Ctrl+C restore behaviour, then removes the interface. Exit status is non-zero if any check fails.
+
+---
+
+### **Scheduled Rotation (systemd timer)**
+
+Rotate an interface's MAC/IP automatically on a repeating schedule with a systemd timer (default: every 5 minutes):
+
+```bash
+# Rotate MAC + IP every 5 minutes (default)
+sudo python3 tools/install_rotation.py -i wlan0
+
+# Rotate only the IP every 30 minutes
+sudo python3 tools/install_rotation.py -i wlan0 --tool 04_auto_ip_changer.py --every 30min
+
+# Rotate IPv6 addresses
+sudo python3 tools/install_rotation.py -i wlan0 --ipv6
+
+# Remove the scheduled rotation
+sudo python3 tools/install_rotation.py --uninstall
+```
+
+How it works:
+- Installs `macip-rotate.service` + `macip-rotate.timer` into `/etc/systemd/system/` (name overridable with `--prefix`) and enables the timer (`--dry-run` previews everything).
+- Each timer fire runs one rotation of the chosen auto changer with `--no-save`, so the original configuration saved by an earlier run is **never overwritten** — `restore` always reverts to the true original.
+- Useful commands: `systemctl list-timers` (status), `journalctl -u macip-rotate.service -f` (logs).
+- To stop rotation and revert the interface: `sudo systemctl stop macip-rotate.timer` then `sudo python3 tools/restore.py -i wlan0`.
 
 ---
 

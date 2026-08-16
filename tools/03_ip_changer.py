@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manually change the IP address of a network interface."""
+"""Manually change the IP address (IPv4 or IPv6) of a network interface."""
 
 import argparse
 import sys
@@ -10,14 +10,14 @@ from macip_lib import MacipError
 
 def get_arguments():
     parser = argparse.ArgumentParser(
-        description="Manually change the IP address of a network interface"
+        description="Manually change the IP address (IPv4 or IPv6) of a network interface"
     )
     parser.add_argument("-i", "--interface", required=True,
                         help="Network interface to change (e.g. wlan0, eth0)")
     parser.add_argument("-ip", "--ipaddress", dest="new_ip", required=True,
-                        help="New IPv4 address (e.g. 192.168.1.100)")
-    parser.add_argument("--prefix", type=int, default=24, metavar="N",
-                        help="CIDR prefix length of the new address (default: 24)")
+                        help="New IP address - IPv4 (e.g. 192.168.1.100) or IPv6 (e.g. fd00::1)")
+    parser.add_argument("--prefix", type=int, default=None, metavar="N",
+                        help="CIDR prefix length (default: 24 for IPv4, 64 for IPv6)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the change without touching the system")
     parser.add_argument("--no-save", action="store_true",
@@ -42,19 +42,23 @@ def main():
 
         if not macip_lib.validate_ip(args.new_ip):
             raise MacipError(
-                "Invalid IP address. Expected a valid IPv4 address (e.g. 192.168.1.100)."
+                "Invalid IP address. Expected a valid IPv4 (e.g. 192.168.1.100) "
+                "or IPv6 (e.g. fd00::1) address."
             )
 
-        current = macip_lib.get_current_ip(args.interface)
-        macip_lib.log(f"[*] Current IP address of {args.interface}: {current}")
+        version = macip_lib.ip_version(args.new_ip)
+        prefix = args.prefix if args.prefix is not None else (64 if version == 6 else 24)
+
+        current = macip_lib.get_current_ip(args.interface, version)
+        macip_lib.log(f"[*] Current IPv{version} address of {args.interface}: {current}")
 
         if not args.no_save:
             macip_lib.save_config(args.interface)
 
-        macip_lib.set_ip(args.interface, args.new_ip, args.prefix)
+        macip_lib.set_ip(args.interface, args.new_ip, prefix)
 
-        updated = macip_lib.get_current_ip(args.interface)
-        if updated == args.new_ip:
+        updated = macip_lib.get_current_ip(args.interface, version)
+        if updated and macip_lib.normalize_ip(updated) == macip_lib.normalize_ip(args.new_ip):
             macip_lib.log(f"[+] IP address successfully changed to {updated}")
         else:
             raise MacipError("Failed to change the IP address.")

@@ -75,6 +75,8 @@ main_menu() {
   echo "  list        List available tools"
   echo "  options     Show MacIP configuration"
   echo "  restore     Restore the original configuration of an interface"
+  echo "  restore-all Restore every interface MacIP has touched"
+  echo "  status      Show saved configurations and rotation timers"
   echo "  update      Update MacIP"
   echo "  use #       Use a specific tool by its number"
   echo ""
@@ -150,6 +152,8 @@ show_options() {
   echo ""
   echo "Extra commands:"
   echo "  restore     - Revert an interface to its saved original MAC/IP."
+  echo "  restore-all - Revert every interface MacIP has touched."
+  echo "  status      - Show saved configurations and rotation timers."
   echo "  interfaces  - Show the network interfaces visible on this system."
 }
 
@@ -162,6 +166,8 @@ show_help() {
   echo "  list        List available tools"
   echo "  options     Show MacIP configuration"
   echo "  restore     Restore the original configuration of an interface"
+  echo "  restore-all Restore every interface MacIP has touched"
+  echo "  status      Show saved configurations and rotation timers"
   echo "  update      Update MacIP"
   echo "  use #       Use a specific tool by its number"
 }
@@ -220,8 +226,16 @@ restore_config() {
   "$PYTHON" "$SCRIPT_DIR/tools/restore.py" -i "$iface"
 }
 
+restore_all_configs() {
+  "$PYTHON" "$SCRIPT_DIR/tools/restore.py" --all
+}
+
 show_interfaces() {
   "$PYTHON" "$SCRIPT_DIR/tools/interfaces.py"
+}
+
+show_status() {
+  "$PYTHON" "$SCRIPT_DIR/tools/status.py"
 }
 
 update_macip() {
@@ -266,6 +280,12 @@ while true; do
       ;;
     restore)
       restore_config
+      ;;
+    restore-all)
+      restore_all_configs
+      ;;
+    status)
+      show_status
       ;;
     update)
       update_macip
