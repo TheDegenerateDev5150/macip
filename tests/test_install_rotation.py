@@ -75,6 +75,9 @@ def test_install_writes_units_and_enables_timer(cli, installer, tmp_path, monkey
         systemctl_calls.append(list(cmd))
         return __import__("subprocess").CompletedProcess(list(cmd), 0, "", "")
 
+    # The interface probe shells out on POSIX; stub it so the recorded call
+    # list is deterministic on every runner OS.
+    monkeypatch.setattr(macip_lib, "interface_exists", lambda iface: True)
     monkeypatch.setattr(macip_lib, "_run", fake_run)
     code = cli(installer, ["-i", "wlan0", "--dest", str(tmp_path)])
     assert code == 0

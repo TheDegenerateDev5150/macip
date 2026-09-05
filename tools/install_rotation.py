@@ -147,7 +147,9 @@ def _install(args):
     if args.times < 1:
         raise MacipError("--times must be at least 1.")
 
-    if os.name == "posix" and not macip_lib.interface_exists(args.interface):
+    # The interface probe shells out, so it must never run in dry-run mode
+    # (dry-run guarantees no commands are executed).
+    if not args.dry_run and os.name == "posix" and not macip_lib.interface_exists(args.interface):
         macip_lib.log(f"[-] Warning: interface '{args.interface}' does not seem to exist.")
 
     dest = Path(args.dest)
